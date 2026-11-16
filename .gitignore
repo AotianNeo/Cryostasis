@@ -1,0 +1,17 @@
+build/
+app/build/
+.gradle/
+.idea/
+*.iml
+local.properties
+*.apk
+*.ap_
+*.dex
+*.class
+*.idsig
+*.jks
+*.keystore
+tools/libs/*.jar
+__pycache__/
+*.pyc
+.DS_Store

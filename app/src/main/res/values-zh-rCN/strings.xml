@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Cryostasis</string>
+    <string name="xposed_desc">零硬编码自适应 HyperOS / MIUI 全版本：拦截低电量 30 秒关机倒计时，无缝切入超级省电休眠态</string>
+</resources>
