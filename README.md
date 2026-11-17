@@ -28,9 +28,9 @@ flowchart TD
 
 | Layer | Mechanism | Responsibility |
 |---|---|---|
-| **1. Runtime DEX Anchor Locator** | Parses `classes*.dex` headers (`string_ids`, `type_ids`, `proto_ids`, `field_ids`, `method_ids`, `class_defs`) & Dalvik `0x1A` / `0x1B` opcodes | Resolves trigger (`charger,low-battery`), countdown (`Already displayed power off countdown`), `REQUEST_SHUTDOWN` helpers, and fallback `changeSuperPowerMode` static helpers without hardcoded class names |
-| **2. Application Hooks & Anti-Loop Guard** | Hooks resolved obfuscated methods + checks `power_supersave_mode_open` | Intercepts T-0 shutdown cleanly and skips repeat countdown popups once Ultra Battery Saver is already active |
-| **3. Framework Intent Fallback** | Hooks `ContextWrapper` & `ContextImpl` (`startActivity`, `sendBroadcast`) | Catches `REQUEST_SHUTDOWN` / `ACTION_REQUEST_SHUTDOWN` intents even if a future SecurityCenter refactor moves callers |
+| **1. Runtime DEX Anchor Locator** | Parses `classes*.dex` headers (`string_ids`, `type_ids`, `proto_ids`, `field_ids`, `method_ids`, `class_defs`) & Dalvik `0x1A` / `0x1B` opcodes | Resolves trigger (`charger,low-battery`), countdown (`Already displayed power off countdown`), `REQUEST_SHUTDOWN` helpers, `SuperPowerSaveManager.switchSuperPower`, and `changeSuperPowerMode` static helpers without hardcoded class names |
+| **2. Owner-User & Anti-Loop Guards** | Restricts shutdown interception to Owner User (`user 0`), guards non-owner `PowerSaverProvider`/`switchSuperPower` entry, checks `power_supersave_mode_open` + `enter_local` + cooldown | Prevents non-owner / work profiles (e.g., User 10) from entering Super Power Save concurrently and corrupting shared `force_fsg_nav_bar`, animation scales, or `UiModeManagerService.mNightMode` |
+| **3. Framework Intent Fallback** | Hooks `ContextWrapper` & `ContextImpl` (`startActivity`, `sendBroadcast`) | Catches explicit low-battery `REQUEST_SHUTDOWN` / `ACTION_REQUEST_SHUTDOWN` intents while ignoring `null`-reason scheduled shutdowns on MIUI 12.2 – HyperOS 1.0 |
 | **4. 3-Channel Handoff & Dynamic Localization** | `PowerSaverProvider` (`content://com.miui.powercenter.powersaver`) → dynamic helper → `Settings.System` + `Resources.getIdentifier` | Activates Ultra Battery Saver reliably and dynamically rewrites dialog/notification warning strings (ZH & EN) without hardcoded `R.string` hex IDs |
 
 ### Safety Guarantees

@@ -8,10 +8,13 @@ import android.content.Intent;
 import android.content.res.Resources;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Process;
+import android.os.SystemClock;
 import android.provider.Settings;
 
 import java.lang.reflect.Method;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicLong;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -22,24 +25,34 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * Cryostasis LSPosed entry hook.
  *
- * Intercepts MIUI/HyperOS 30-second low-battery shutdowns and transitions the device
- * into Ultra Battery Saver stasis without hardcoded obfuscated class or method names.
+ * Intercepts MIUI/HyperOS 30-second low-battery shutdowns in the owner user (user 0)
+ * and transitions the device into Ultra Battery Saver stasis without hardcoded obfuscated names,
+ * while preventing non-owner profiles from racing or mutating shared global UI/nav settings.
  */
 public class CryostasisHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "[Cryostasis] ";
     private static final String PKG_SECURITY_CENTER = "com.miui.securitycenter";
     private static final String PKG_POWER_CENTER = "com.miui.powercenter";
+    private static final String POWER_SAVER_PROVIDER_CLASS = "com.miui.powercenter.powersaver.PowerSaverProvider";
 
     private static final String ACTION_REQ_SHUT = "com.android.internal.intent.action.REQUEST_SHUTDOWN";
     private static final String ACTION_REQ_SHUT_OLD = "android.intent.action.ACTION_REQUEST_SHUTDOWN";
     private static final String EXTRA_REASON = "android.intent.extra.REASON";
     private static final String SETTING_SUPERSAVE_OPEN = "power_supersave_mode_open";
+    private static final String SETTING_SUPERSAVE_ENTER_LOCAL = "pc_security_center_super_power_mode_enter_local";
+
+    private static final long ENTER_COOLDOWN_MS = 10_000L;
+    private static final AtomicLong sLastEnterElapsedMs = new AtomicLong(-ENTER_COOLDOWN_MS);
 
     public static volatile int sResIdWarningMsg = 0;
     public static volatile int sResIdNotifTitle = 0;
     public static volatile int sResIdNotifMsg = 0;
     public static volatile DexLocator.LocateResult sLocateResult = null;
+
+    public static int getMyUserId() {
+        return Process.myUid() / 100000;
+    }
 
     public static boolean claimOnce(String key) {
         try {
@@ -56,14 +69,24 @@ public class CryostasisHook implements IXposedHookLoadPackage {
             return;
         }
 
+        final int userId = getMyUserId();
         if (claimOnce("cryostasis.log")) {
-            XposedBridge.log(TAG + "Loaded in " + lpparam.packageName + " (" + lpparam.processName + ")");
+            XposedBridge.log(TAG + "Loaded in " + lpparam.packageName
+                    + " (" + lpparam.processName + ", user=" + userId + ")");
         }
-        installFrameworkHooks();
+
+        if (userId != 0) {
+            // Non-owner / managed profiles must never enter Super Power Save concurrently,
+            // otherwise they mutate shared Settings.Global (force_fsg_nav_bar, animation scales)
+            // and UiModeManagerService.mNightMode after/before User 0 backs up its baseline.
+            installNonOwnerProviderGuard(lpparam.classLoader, userId);
+        } else {
+            installFrameworkHooks();
+        }
 
         Context app = getCurrentApplication();
         if (app != null) {
-            initWithContext(app, lpparam);
+            initWithContext(app, lpparam, userId);
             return;
         }
 
@@ -75,13 +98,13 @@ public class CryostasisHook implements IXposedHookLoadPackage {
             protected void afterHookedMethod(MethodHookParam param) {
                 Context ctx = (Context) param.args[0];
                 if (ctx != null) {
-                    initWithContext(ctx, lpparam);
+                    initWithContext(ctx, lpparam, userId);
                 }
             }
         });
     }
 
-    public static void initWithContext(Context ctx, XC_LoadPackage.LoadPackageParam lpparam) {
+    public static void initWithContext(Context ctx, XC_LoadPackage.LoadPackageParam lpparam, int userId) {
         if (!claimOnce("cryostasis.init")) {
             return;
         }
@@ -90,16 +113,71 @@ public class CryostasisHook implements IXposedHookLoadPackage {
             if (appCtx != null) {
                 ctx = appCtx;
             }
-            resolveResourceIds(ctx);
-
             String sourceDir = lpparam.appInfo != null ? lpparam.appInfo.sourceDir : null;
             String[] splitDirs = lpparam.appInfo != null ? lpparam.appInfo.splitSourceDirs : null;
             DexLocator.LocateResult res = DexLocator.locate(ctx, sourceDir, splitDirs);
             sLocateResult = res;
 
+            if (userId != 0) {
+                installNonOwnerSwitchGuard(lpparam.classLoader, res, userId);
+                return;
+            }
+
+            resolveResourceIds(ctx);
             applyDynamicHooks(lpparam.classLoader, res);
         } catch (Throwable t) {
             XposedBridge.log(TAG + "initWithContext error: " + t);
+        }
+    }
+
+    private static void installNonOwnerProviderGuard(ClassLoader cl, final int userId) {
+        if (!claimOnce("cryostasis.nonowner.provider")) {
+            return;
+        }
+        try {
+            Class<?> cls = XposedHelpers.findClassIfExists(POWER_SAVER_PROVIDER_CLASS, cl);
+            if (cls == null) return;
+            XposedHelpers.findAndHookMethod(cls, "call", String.class, String.class, Bundle.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    String method = (String) param.args[0];
+                    Bundle extras = (Bundle) param.args[2];
+                    if (("changeSuperPowerMode".equals(method) || "changeExtremeEnduranceMode".equals(method))
+                            && extras != null && extras.getBoolean("POWER_SUPERSAVE_MODE_OPEN", false)) {
+                        XposedBridge.log(TAG + "Blocked non-owner user " + userId
+                                + " PowerSaverProvider." + method + "(open=true)");
+                        param.setResult(new Bundle());
+                    }
+                }
+            });
+            XposedBridge.log(TAG + "Installed non-owner PowerSaverProvider guard for user=" + userId);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "installNonOwnerProviderGuard error: " + t);
+        }
+    }
+
+    private static void installNonOwnerSwitchGuard(ClassLoader cl, DexLocator.LocateResult res, final int userId) {
+        if (res.switchClass == null || res.switchMethod == null) {
+            return;
+        }
+        try {
+            Class<?> cls = XposedHelpers.findClassIfExists(res.switchClass, cl);
+            if (cls == null) return;
+            XposedHelpers.findAndHookMethod(cls, res.switchMethod,
+                    boolean.class, boolean.class, boolean.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (Boolean.TRUE.equals(param.args[0])) {
+                        XposedBridge.log(TAG + "Blocked non-owner user " + userId
+                                + " " + res.switchClass + "." + res.switchMethod + "(true)");
+                        param.setResult(null);
+                    }
+                }
+            });
+            XposedBridge.log(TAG + "Installed non-owner switchSuperPower guard for user=" + userId
+                    + ": " + res.switchClass + "." + res.switchMethod);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "installNonOwnerSwitchGuard error: " + t);
         }
     }
 
@@ -173,6 +251,8 @@ public class CryostasisHook implements IXposedHookLoadPackage {
             if (clsName.contains("bootshutdown") || clsName.contains("ShutdownAlarm")) {
                 continue;
             }
+            // MIUI 12.2-13 PowerOffUI shutdown methods take ()V with null Intent reason
+            final boolean isLegacyPowerUiTrigger = clsName.contains(".powerui.") && "()".equals(pSig);
             try {
                 Class<?> cls = XposedHelpers.findClassIfExists(clsName, cl);
                 if (cls == null) continue;
@@ -183,11 +263,11 @@ public class CryostasisHook implements IXposedHookLoadPackage {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         String reason = findReasonArg(param.args);
-                        if (shouldInterceptReason(reason)) {
+                        if (isLegacyPowerUiTrigger || shouldInterceptReason(reason)) {
                             XposedBridge.log(TAG + "Intercepted util " + clsName + "." + mName
                                     + " reason=" + reason);
                             Context ctx = findContextArg(param.args);
-                            if (ctx == null) ctx = getCurrentApplication();
+                            if (ctx == null) ctx = extractContext(param.thisObject, res.triggerCtxField);
                             enterSuperPowerMode(ctx);
                             param.setResult(null);
                         }
@@ -205,7 +285,7 @@ public class CryostasisHook implements IXposedHookLoadPackage {
         if (!claimOnce("cryostasis.fw")) {
             return;
         }
-        // Fallback Intent interception independent of any obfuscation
+        // Fallback Intent interception independent of any obfuscation (only explicit low-battery reasons)
         XC_MethodHook intentHook = new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
@@ -289,26 +369,37 @@ public class CryostasisHook implements IXposedHookLoadPackage {
 
     public static boolean shouldInterceptReason(String reason) {
         if (reason == null) {
-            return true;
+            // Avoid hijacking scheduled ShutdownAlarmIntentService calls on MIUI 12.2 - HyperOS 1.0
+            // that pass null reason; legacy no-arg powerui triggers are handled explicitly.
+            return false;
         }
         String lower = reason.toLowerCase(Locale.ROOT);
         if (lower.contains("timed_shutdown") || lower.contains("temp") || lower.contains("thermal")
-                || lower.contains("userrequested") || lower.contains("reboot") || lower.contains("recovery")) {
+                || lower.contains("userrequested") || lower.contains("reboot")
+                || lower.contains("recovery") || lower.contains("shipmode")) {
             return false;
         }
-        return lower.contains("low-battery") || lower.contains("low_battery") || lower.contains("battery");
+        return lower.contains("low-battery") || lower.contains("low_battery") || "battery".equals(lower);
     }
 
     static boolean isSuperPowerModeOpen(Context ctx) {
         if (ctx == null) return false;
         try {
-            return Settings.System.getInt(ctx.getContentResolver(), SETTING_SUPERSAVE_OPEN, 0) != 0;
+            ContentResolver cr = ctx.getContentResolver();
+            if (Settings.System.getInt(cr, SETTING_SUPERSAVE_OPEN, 0) != 0) {
+                return true;
+            }
+            // Set synchronously inside SuperPowerSaveManager.Z(true) ~2000ms before power_supersave_mode_open
+            return Settings.Secure.getInt(cr, SETTING_SUPERSAVE_ENTER_LOCAL, 0) != 0;
         } catch (Throwable ignored) {
             return false;
         }
     }
 
     static void enterSuperPowerMode(Context ctx) {
+        if (getMyUserId() != 0) {
+            return;
+        }
         if (ctx == null) {
             ctx = getCurrentApplication();
         }
@@ -318,6 +409,13 @@ public class CryostasisHook implements IXposedHookLoadPackage {
         }
         if (isSuperPowerModeOpen(ctx)) {
             XposedBridge.log(TAG + "Super Power Save mode already open");
+            return;
+        }
+
+        long prev = sLastEnterElapsedMs.get();
+        long now = SystemClock.elapsedRealtime();
+        if (now - prev < ENTER_COOLDOWN_MS || !sLastEnterElapsedMs.compareAndSet(prev, now)) {
+            XposedBridge.log(TAG + "Super Power Save entry already in progress (cooldown)");
             return;
         }
 
@@ -358,7 +456,9 @@ public class CryostasisHook implements IXposedHookLoadPackage {
             ContentResolver cr = ctx.getContentResolver();
             Settings.System.putInt(cr, SETTING_SUPERSAVE_OPEN, 1);
             XposedBridge.log(TAG + "Applied legacy Settings.System fallback");
+            return;
         } catch (Throwable t) {
+            sLastEnterElapsedMs.set(prev);
             XposedBridge.log(TAG + "All SuperPower channels failed: " + t);
         }
     }

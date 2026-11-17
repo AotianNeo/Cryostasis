@@ -17,9 +17,9 @@
      - 倒计时入口函数（锚点 `Already displayed power off countdown`，签名 `()V`）
      - 关机发送工具方法（锚点 `REQUEST_SHUTDOWN` / `ACTION_REQUEST_SHUTDOWN`）
      - 备用超级省电静态入口（锚点 `changeSuperPowerMode` + `POWER_SUPERSAVE_MODE_OPEN`）
-2. **动态方法 Hook 与防循环守卫**（[`CryostasisHook.java`](app/src/main/java/io/github/aotianneo/cryostasis/CryostasisHook.java)）
-   - 倒计时前置检测 `Settings.System` 中的 `power_supersave_mode_open`，若已在超级省电态则直接跳过倒计时，防止粘性广播反复弹窗。
-   - 对非低电关机原因（如定时关机 `timed_shutdown`、高温保护 `temp` / `thermal`、手动关机 `userrequested`、`reboot`、`recovery`）完全放行，不影响正常关机与安全保护。
+2. **主用户隔离与防循环守卫**（[`CryostasisHook.java`](app/src/main/java/io/github/aotianneo/cryostasis/CryostasisHook.java)）
+   - 严格限定只在主用户（`user 0`）触发低电截停并进入超级省电；同时在分身/工作空间（非 `0` 号用户）拦截 `PowerSaverProvider` 与动态定位到的 `switchSuperPower(true, ...)` 进入动作，防止双用户并发进入超级省电互相覆盖跨用户共享的全面屏手势（`force_fsg_nav_bar`）、动画缩放与 `UiModeManagerService` 暗色模式状态。
+   - 倒计时前置同时检查 `power_supersave_mode_open` 与同步写入的 `pc_security_center_super_power_mode_enter_local` 并附带 10 秒冷却锁，防止粘性广播与延迟写入窗口期内重复弹窗；对 `reason == null` 的定时关机（MIUI 12.2–HyperOS 1.0）及非低电关机原因完全放行。
 3. **与混淆无关的 Framework 兜底拦截**
    - Hook `ContextWrapper` 与 `ContextImpl` 的 `startActivity`、`sendBroadcast`，兜底截获直接发出的系统关机 Intent。
 4. **三通道切入超级省电 & 动态文案本地化**

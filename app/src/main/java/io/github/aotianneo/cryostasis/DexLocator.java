@@ -27,8 +27,9 @@ public class DexLocator {
     public static final String ANCHOR_COUNTDOWN = "Already displayed power off countdown";
     public static final String ANCHOR_CHANGE_SP = "changeSuperPowerMode";
     public static final String ANCHOR_SP_OPEN = "POWER_SUPERSAVE_MODE_OPEN";
+    public static final String ANCHOR_SWITCH_SP = "switchSuperPower enter super power : ";
 
-    private static final String PREF_NAME = "cryostasis_dex_locator_v1";
+    private static final String PREF_NAME = "cryostasis_dex_locator_v2";
 
     public static class LocateResult {
         public String triggerClass;
@@ -42,6 +43,9 @@ public class DexLocator {
 
         public String superPowerClass;
         public String superPowerMethod;
+
+        public String switchClass;
+        public String switchMethod;
     }
 
     public static LocateResult locate(Context context, String apkPath, String[] splitPaths) {
@@ -70,7 +74,8 @@ public class DexLocator {
     }
 
     private static boolean hasAnyHit(LocateResult r) {
-        return r.triggerClass != null || r.countdownClass != null || !r.utilMethods.isEmpty();
+        return r.triggerClass != null || r.countdownClass != null
+                || r.switchClass != null || !r.utilMethods.isEmpty();
     }
 
     private static String buildCacheKey(Context context, String apkPath) {
@@ -97,6 +102,8 @@ public class DexLocator {
             r.countdownMethod = sp.getString("cm", null);
             r.superPowerClass = sp.getString("sc", null);
             r.superPowerMethod = sp.getString("sm", null);
+            r.switchClass = sp.getString("swc", null);
+            r.switchMethod = sp.getString("swm", null);
             String utils = sp.getString("um", "");
             if (utils != null && !utils.isEmpty()) {
                 for (String item : utils.split("\n")) {
@@ -123,6 +130,8 @@ public class DexLocator {
             ed.putString("cm", r.countdownMethod);
             ed.putString("sc", r.superPowerClass);
             ed.putString("sm", r.superPowerMethod);
+            ed.putString("swc", r.switchClass);
+            ed.putString("swm", r.switchMethod);
             StringBuilder sb = new StringBuilder();
             for (int i = 0; i < r.utilMethods.size(); i++) {
                 if (i > 0) sb.append('\n');
@@ -181,8 +190,10 @@ public class DexLocator {
         int idxCountdown = findStringIndex(dex, strIdsSize, strIdsOff, ANCHOR_COUNTDOWN);
         int idxChangeSp = findStringIndex(dex, strIdsSize, strIdsOff, ANCHOR_CHANGE_SP);
         int idxSpOpen = findStringIndex(dex, strIdsSize, strIdsOff, ANCHOR_SP_OPEN);
+        int idxSwitchSp = findStringIndex(dex, strIdsSize, strIdsOff, ANCHOR_SWITCH_SP);
 
-        if (idxLowBat < 0 && idxReqShut < 0 && idxReqShutOld < 0 && idxCountdown < 0 && idxChangeSp < 0) {
+        if (idxLowBat < 0 && idxReqShut < 0 && idxReqShutOld < 0 && idxCountdown < 0
+                && idxChangeSp < 0 && idxSwitchSp < 0) {
             return;
         }
 
@@ -233,7 +244,8 @@ public class DexLocator {
                     int insnsSize = u32(dex, codeOff + 12);
                     int insnsOff = codeOff + 16;
                     int flags = scanMethodStrings(dex, insnsOff, insnsSize,
-                            idxLowBat, idxReqShut, idxReqShutOld, idxCountdown, idxChangeSp, idxSpOpen);
+                            idxLowBat, idxReqShut, idxReqShutOld, idxCountdown,
+                            idxChangeSp, idxSpOpen, idxSwitchSp);
                     if (flags == 0) continue;
 
                     int mBase = methodIdsOff + mIdx * 8;
@@ -267,13 +279,17 @@ public class DexLocator {
                         out.superPowerClass = clsName;
                         out.superPowerMethod = mName;
                     }
+                    if ((flags & 64) != 0 && "(ZZZ)".equals(paramSig) && "V".equals(retType)) {
+                        out.switchClass = clsName;
+                        out.switchMethod = mName;
+                    }
                 }
             }
         }
     }
 
     private static int scanMethodStrings(byte[] dex, int insnsOff, int insnsSize,
-            int s1, int s2, int s3, int s4, int s5, int s6) {
+            int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
         int flags = 0;
         int ip = 0;
         while (ip < insnsSize) {
@@ -281,11 +297,11 @@ public class DexLocator {
             int op = w0 & 0xFF;
             if (op == 0x1A && ip + 1 < insnsSize) {
                 int sidx = u16(dex, insnsOff + (ip + 1) * 2);
-                flags |= matchStr(sidx, s1, s2, s3, s4, s5, s6);
+                flags |= matchStr(sidx, s1, s2, s3, s4, s5, s6, s7);
                 ip += 2;
             } else if (op == 0x1B && ip + 2 < insnsSize) {
                 int sidx = u32(dex, insnsOff + (ip + 1) * 2);
-                flags |= matchStr(sidx, s1, s2, s3, s4, s5, s6);
+                flags |= matchStr(sidx, s1, s2, s3, s4, s5, s6, s7);
                 ip += 3;
             } else {
                 ip += insnStep(dex, insnsOff, ip, w0, op);
@@ -294,7 +310,7 @@ public class DexLocator {
         return flags;
     }
 
-    private static int matchStr(int sidx, int s1, int s2, int s3, int s4, int s5, int s6) {
+    private static int matchStr(int sidx, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
         int f = 0;
         if (sidx == s1) f |= 1;
         if (sidx == s2) f |= 2;
@@ -302,6 +318,7 @@ public class DexLocator {
         if (sidx == s4) f |= 8;
         if (sidx == s5) f |= 16;
         if (sidx == s6) f |= 32;
+        if (sidx == s7) f |= 64;
         return f;
     }
 
@@ -343,11 +360,11 @@ public class DexLocator {
     }
 
     private static int findStringIndex(byte[] dex, int size, int off, String target) {
+        byte[] targetMutf8 = toMutf8(target);
         int lo = 0, hi = size - 1;
         while (lo <= hi) {
             int mid = (lo + hi) >>> 1;
-            String s = getString(dex, off, mid);
-            int cmp = compareMutf8(s, target);
+            int cmp = compareRawMutf8(dex, off, mid, targetMutf8);
             if (cmp == 0) return mid;
             if (cmp < 0) lo = mid + 1;
             else hi = mid - 1;
@@ -355,16 +372,38 @@ public class DexLocator {
         return -1;
     }
 
-    private static int compareMutf8(String a, String b) {
-        byte[] ba = a.getBytes(StandardCharsets.UTF_8);
-        byte[] bb = b.getBytes(StandardCharsets.UTF_8);
-        int len = Math.min(ba.length, bb.length);
+    private static byte[] toMutf8(String s) {
+        int len = s.length();
+        ByteArrayOutputStream bos = new ByteArrayOutputStream(len);
         for (int i = 0; i < len; i++) {
-            int va = ba[i] & 0xFF;
-            int vb = bb[i] & 0xFF;
-            if (va != vb) return va - vb;
+            char c = s.charAt(i);
+            if (c != 0 && c <= 0x7F) {
+                bos.write(c);
+            } else if (c <= 0x7FF) {
+                bos.write(0xC0 | (0x1F & (c >> 6)));
+                bos.write(0x80 | (0x3F & c));
+            } else {
+                bos.write(0xE0 | (0x0F & (c >> 12)));
+                bos.write(0x80 | (0x3F & (c >> 6)));
+                bos.write(0x80 | (0x3F & c));
+            }
         }
-        return ba.length - bb.length;
+        return bos.toByteArray();
+    }
+
+    private static int compareRawMutf8(byte[] dex, int strIdsOff, int idx, byte[] targetMutf8) {
+        int dataOff = u32(dex, strIdsOff + idx * 4);
+        int[] p = new int[]{dataOff};
+        readUleb(dex, p);
+        int start = p[0];
+        for (int i = 0; i < targetMutf8.length; i++) {
+            int db = (start + i < dex.length) ? (dex[start + i] & 0xFF) : 0;
+            if (db == 0) return -1;
+            int tb = targetMutf8[i] & 0xFF;
+            if (db != tb) return db - tb;
+        }
+        int next = (start + targetMutf8.length < dex.length) ? (dex[start + targetMutf8.length] & 0xFF) : 0;
+        return next == 0 ? 0 : 1;
     }
 
     private static int findTypeIndex(byte[] dex, int typeSize, int typeOff, int strSize, int strOff, String desc) {
@@ -492,6 +531,7 @@ public class DexLocator {
         System.out.println("trigger=" + r.triggerClass + "." + r.triggerMethod + " ctxField=" + r.triggerCtxField);
         System.out.println("countdown=" + r.countdownClass + "." + r.countdownMethod);
         System.out.println("superPower=" + r.superPowerClass + "." + r.superPowerMethod);
+        System.out.println("switch=" + r.switchClass + "." + r.switchMethod);
         System.out.println("utils=" + r.utilMethods);
     }
 }
