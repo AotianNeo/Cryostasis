@@ -76,13 +76,10 @@ public class CryostasisHook implements IXposedHookLoadPackage {
         }
 
         if (userId != 0) {
-            // Non-owner / managed profiles must never enter Super Power Save concurrently,
-            // otherwise they mutate shared Settings.Global (force_fsg_nav_bar, animation scales)
-            // and UiModeManagerService.mNightMode after/before User 0 backs up its baseline.
+            // Block non-owner / managed profiles from entering Super Power Save concurrently.
             installNonOwnerProviderGuard(lpparam.classLoader, userId);
-        } else {
-            installFrameworkHooks();
         }
+        installFrameworkHooks(userId);
 
         Context app = getCurrentApplication();
         if (app != null) {
@@ -120,11 +117,10 @@ public class CryostasisHook implements IXposedHookLoadPackage {
 
             if (userId != 0) {
                 installNonOwnerSwitchGuard(lpparam.classLoader, res, userId);
-                return;
+            } else {
+                resolveResourceIds(ctx);
             }
-
-            resolveResourceIds(ctx);
-            applyDynamicHooks(lpparam.classLoader, res);
+            applyDynamicHooks(lpparam.classLoader, res, userId);
         } catch (Throwable t) {
             XposedBridge.log(TAG + "initWithContext error: " + t);
         }
@@ -195,8 +191,17 @@ public class CryostasisHook implements IXposedHookLoadPackage {
         }
     }
 
-    public static void applyDynamicHooks(final ClassLoader cl, final DexLocator.LocateResult res) {
-        // 1. Hook countdown start method (prevents sticky-broadcast re-trigger loop after entering stasis)
+    private static void dispatchLowBatteryShutdown(int userId, Context ctx, String sourceDesc) {
+        if (userId != 0) {
+            XposedBridge.log(TAG + "Blocked non-owner user " + userId + " shutdown (" + sourceDesc + ")");
+            return;
+        }
+        XposedBridge.log(TAG + "Intercepted 30s low-battery shutdown (" + sourceDesc + ")");
+        enterSuperPowerMode(ctx);
+    }
+
+    public static void applyDynamicHooks(final ClassLoader cl, final DexLocator.LocateResult res, final int userId) {
+        // 1. Hook countdown start method (suppress non-owner duplicates & owner re-trigger loops)
         if (res.countdownClass != null && res.countdownMethod != null) {
             try {
                 Class<?> cls = XposedHelpers.findClassIfExists(res.countdownClass, cl);
@@ -204,6 +209,12 @@ public class CryostasisHook implements IXposedHookLoadPackage {
                     XposedHelpers.findAndHookMethod(cls, res.countdownMethod, new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
+                            if (userId != 0) {
+                                XposedBridge.log(TAG + "Suppressed non-owner user " + userId
+                                        + " countdown (" + res.countdownClass + "." + res.countdownMethod + ")");
+                                param.setResult(null);
+                                return;
+                            }
                             Context ctx = extractContext(param.thisObject, res.triggerCtxField);
                             if (isSuperPowerModeOpen(ctx)) {
                                 XposedBridge.log(TAG + "Already in Super Power Save mode, skip countdown UI");
@@ -226,10 +237,8 @@ public class CryostasisHook implements IXposedHookLoadPackage {
                     XposedHelpers.findAndHookMethod(cls, res.triggerMethod, new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            XposedBridge.log(TAG + "Intercepted 30s low-battery shutdown trigger ("
-                                    + res.triggerClass + "." + res.triggerMethod + ")");
                             Context ctx = extractContext(param.thisObject, res.triggerCtxField);
-                            enterSuperPowerMode(ctx);
+                            dispatchLowBatteryShutdown(userId, ctx, res.triggerClass + "." + res.triggerMethod);
                             param.setResult(null);
                         }
                     });
@@ -264,11 +273,9 @@ public class CryostasisHook implements IXposedHookLoadPackage {
                     protected void beforeHookedMethod(MethodHookParam param) {
                         String reason = findReasonArg(param.args);
                         if (isLegacyPowerUiTrigger || shouldInterceptReason(reason)) {
-                            XposedBridge.log(TAG + "Intercepted util " + clsName + "." + mName
-                                    + " reason=" + reason);
                             Context ctx = findContextArg(param.args);
                             if (ctx == null) ctx = extractContext(param.thisObject, res.triggerCtxField);
-                            enterSuperPowerMode(ctx);
+                            dispatchLowBatteryShutdown(userId, ctx, "util " + clsName + "." + mName + " reason=" + reason);
                             param.setResult(null);
                         }
                     }
@@ -281,7 +288,7 @@ public class CryostasisHook implements IXposedHookLoadPackage {
         }
     }
 
-    public static void installFrameworkHooks() {
+    public static void installFrameworkHooks(final int userId) {
         if (!claimOnce("cryostasis.fw")) {
             return;
         }
@@ -296,11 +303,10 @@ public class CryostasisHook implements IXposedHookLoadPackage {
                 if (ACTION_REQ_SHUT.equals(action) || ACTION_REQ_SHUT_OLD.equals(action)) {
                     String reason = intent.getStringExtra(EXTRA_REASON);
                     if (shouldInterceptReason(reason)) {
-                        XposedBridge.log(TAG + "Intercepted Framework shutdown Intent, reason=" + reason);
                         Context ctx = (param.thisObject instanceof Context)
                                 ? (Context) param.thisObject
                                 : getCurrentApplication();
-                        enterSuperPowerMode(ctx);
+                        dispatchLowBatteryShutdown(userId, ctx, "Framework Intent reason=" + reason);
                         param.setResult(null);
                     }
                 }
@@ -315,8 +321,15 @@ public class CryostasisHook implements IXposedHookLoadPackage {
                 XposedHelpers.findAndHookMethod(ctxImpl, "startActivity", Intent.class, Bundle.class, intentHook);
                 XposedHelpers.findAndHookMethod(ctxImpl, "sendBroadcast", Intent.class, intentHook);
             }
+            if (userId != 0) {
+                XposedBridge.log(TAG + "Hooked Framework shutdown Intent for user=" + userId);
+                return;
+            }
         } catch (Throwable t) {
             XposedBridge.log(TAG + "Framework intent hook error: " + t);
+            if (userId != 0) {
+                return;
+            }
         }
 
         // Dynamic resource text replacement (dialog & notification)
